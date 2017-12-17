@@ -19,6 +19,14 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+ #mkdir -p /usr/share/ca-certificates/sap
+ #cp sap-ca.crt /usr/share/ca-certificates/sap/
+ #cp sme-ca.crt /usr/share/ca-certificates/sap/
+ #echo 'sap/sap-ca.crt' >> /etc/ca-certificates.conf
+ #echo 'sap/sme-ca.crt' >> /etc/ca-certificates.conf
+ #update-ca-certificates
+
+
 export NGINX_VERSION=1.13.7
 export NDK_VERSION=0.3.0
 export VTS_VERSION=0.1.15
@@ -33,6 +41,12 @@ export ZIPKIN_CPP_VERSION=0.1.0
 export MODSECURITY=a2a5858d249222938c2f5e48087a922c63d7f9d8
 
 export BUILD_PATH=/tmp/build
+
+
+export LUA_VERSION=0.10.8
+export LUA_CJSON_VERSION=2.1.0.4
+export LUA_RESTY_HTTP_VERSION=0.07
+export LUA_UPSTREAM_VERSION=0.06
 
 ARCH=$(uname -m)
 
@@ -53,7 +67,7 @@ if [[ ${ARCH} == "ppc64le" ]]; then
 fi
 
 # install required packages to build
-clean-install \
+apt-get update && apt-get install --no-install-recommends -y \
   bash \
   build-essential \
   curl ca-certificates \
@@ -75,6 +89,9 @@ clean-install \
   libcurl4-openssl-dev \
   procps \
   git g++ pkgconf flex bison doxygen libyajl-dev liblmdb-dev libgeoip-dev libtool dh-autoreconf libxml2 libpcre++-dev libxml2-dev \
+  luajit \
+  libluajit-5.1 \
+  libluajit-5.1-dev \
   || exit 1
 
 mkdir -p /etc/nginx
@@ -126,8 +143,25 @@ get_src 3d91e866819986f5dda00549694c4eaca16f1209d1f87aecc8aca3b42aa72e08 \
 get_src 3abdecedb5bf544eeba8c1ce0bef2da6a9f064b216ebbe20b68894afec1d7d80 \
         "https://github.com/SpiderLabs/ModSecurity-nginx/archive/$MODSECURITY.tar.gz"
 
+get_src d67449c71051b3cc2d6dd60df0ae0d21fca08aa19c9b30c5b95ee21ff38ef8dd \
+        "https://github.com/openresty/lua-nginx-module/archive/v$LUA_VERSION.tar.gz"
+ 
+get_src 5417991b6db4d46383da2d18f2fd46b93fafcebfe87ba87f7cfeac4c9bcb0224 \
+        "https://github.com/openresty/lua-cjson/archive/$LUA_CJSON_VERSION.tar.gz"
+
+get_src 1c6aa06c9955397c94e9c3e0c0fba4e2704e85bee77b4512fb54ae7c25d58d86 \
+       "https://github.com/pintsized/lua-resty-http/archive/v$LUA_RESTY_HTTP_VERSION.tar.gz"
+
+get_src 55475fe4f9e4b5220761269ccf0069ebb1ded61d7e7888f9c785c651cff3d141 \
+       "https://github.com/openresty/lua-upstream-nginx-module/archive/v$LUA_UPSTREAM_VERSION.tar.gz"
+
 #https://blog.cloudflare.com/optimizing-tls-over-tcp-to-reduce-latency/
 curl -sSL -o nginx__dynamic_tls_records.patch https://raw.githubusercontent.com/cloudflare/sslconfig/master/patches/nginx__1.11.5_dynamic_tls_records.patch
+
+# https://github.com/openresty/lua-nginx-module/issues/1016 
+curl -sSL -o patch-src-ngx_http_lua_headers.c.diff https://raw.githubusercontent.com/macports/macports-ports/master/www/nginx/files/patch-src-ngx_http_lua_headers.c.diff 
+cd "$BUILD_PATH/lua-nginx-module-$LUA_VERSION" 
+patch -p1 < $BUILD_PATH/patch-src-ngx_http_lua_headers.c.diff 
 
 # build opentracing lib
 cd "$BUILD_PATH/opentracing-cpp-$OPENTRACING_CPP_VERSION"
@@ -170,6 +204,8 @@ if [[ ${ARCH} == "x86_64" ]]; then
   make install
 fi
 
+
+
 # build nginx
 cd "$BUILD_PATH/nginx-$NGINX_VERSION"
 
@@ -211,9 +247,11 @@ WITH_MODULES="--add-module=$BUILD_PATH/ngx_devel_kit-$NDK_VERSION \
   --add-module=$BUILD_PATH/nginx-goodies-nginx-sticky-module-ng-$STICKY_SESSIONS_VERSION \
   --add-module=$BUILD_PATH/nginx-http-auth-digest-$NGINX_DIGEST_AUTH \
   --add-module=$BUILD_PATH/ngx_http_substitutions_filter_module-$NGINX_SUBSTITUTIONS \
+  --add-module="$BUILD_PATH/lua-nginx-module-$LUA_VERSION"  \
+  --add-module="$BUILD_PATH/lua-upstream-nginx-module-$LUA_UPSTREAM_VERSION"  \
   --add-dynamic-module=$BUILD_PATH/nginx-opentracing-$NGINX_OPENTRACING_VERSION/opentracing \
-  --add-dynamic-module=$BUILD_PATH/nginx-opentracing-$NGINX_OPENTRACING_VERSION/zipkin"
-
+  --add-dynamic-module=$BUILD_PATH/nginx-opentracing-$NGINX_OPENTRACING_VERSION/zipkin" 
+ 
 if [[ ${ARCH} == "x86_64" ]]; then
   WITH_MODULES+=" --add-dynamic-module=$BUILD_PATH/ModSecurity-nginx-$MODSECURITY"
 fi
@@ -247,6 +285,24 @@ fi
   && make || exit 1 \
   && make install || exit 1
 
+echo "Installing CJSON module"
+cd "$BUILD_PATH/lua-cjson-$LUA_CJSON_VERSION"
+
+if [[ ${ARCH} == "ppc64le" ]];then
+  LUA_DIR=/usr/include/luajit-2.1
+else
+  LUA_DIR=/usr/include/luajit-2.0
+fi
+make LUA_INCLUDE_DIR=${LUA_DIR} && make install
+
+echo "Installing lua-resty-http module"
+ # copy lua module
+cd "$BUILD_PATH/lua-resty-http-$LUA_RESTY_HTTP_VERSION"
+sed -i 's/resty.http_headers/http_headers/' $BUILD_PATH/lua-resty-http-$LUA_RESTY_HTTP_VERSION/lib/resty/http.lua
+cp $BUILD_PATH/lua-resty-http-$LUA_RESTY_HTTP_VERSION/lib/resty/http.lua /usr/local/lib/lua/5.1
+cp $BUILD_PATH/lua-resty-http-$LUA_RESTY_HTTP_VERSION/lib/resty/http_headers.lua /usr/local/lib/lua/5.1
+ 
+
 echo "Cleaning..."
 
 cd /
@@ -262,12 +318,12 @@ apt-mark unmarkauto \
   geoip-bin \
   libyajl2 liblmdb0 libxml2 libpcre++ \
   gzip \
-  openssl
+  openssl \
+  luajit \
+  libluajit-5.1-2
 
 apt-get remove -y --purge \
   build-essential \
-  gcc-6 \
-  cpp-6 \
   libgeoip-dev \
   libpcre3-dev \
   libssl-dev \
@@ -276,6 +332,7 @@ apt-get remove -y --purge \
   linux-libc-dev \
   cmake \
   wget \
+  libluajit-5.1-dev \
   git g++ pkgconf flex bison doxygen libyajl-dev liblmdb-dev libgeoip-dev libtool dh-autoreconf libpcre++-dev libxml2-dev
 
 apt-get autoremove -y
